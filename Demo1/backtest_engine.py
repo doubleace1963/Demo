@@ -224,14 +224,28 @@ def monitor_trade_on_c3(
     entry_price: float,
     stop_loss: float,
     take_profit: float,
-    fvg_type: str
+    fvg_type: str,
+    aggressive_mode: bool = False
 ) -> Dict:
     """
     Monitor trade on C3 M5 candles starting from entry candle.
     Check each subsequent candle to see if SL or TP is hit first.
     
+    Conservative mode (default):
+    - At 3R: Take 50% profit, move SL to breakeven
+    - Let remaining 50% run to TP or new SL
+    
+    Aggressive mode:
+    - No partial profit taking
+    - Hold full position until TP or SL
+    
     Returns trade result with all details.
     """
+    sl_distance = abs(entry_price - stop_loss)
+    partial_taken = False
+    partial_r = 0.0
+    current_sl = stop_loss
+    
     result = {
         'entry_time': entry_time,
         'entry_price': entry_price,
@@ -245,13 +259,34 @@ def monitor_trade_on_c3(
         'days_held': 0.0,
         'last_checked_time': c3_candles.iloc[-1]['time'] if len(c3_candles) else entry_time,
         'reason': None,
+        'partial_taken': False,
+        'partial_r': 0.0,
     }
     
     # Start checking from the ENTRY candle (trade can resolve immediately).
     for idx in range(entry_candle_idx, len(c3_candles)):
         candle = c3_candles.iloc[idx]
         
-        outcome = check_sl_tp_hit_on_candle(candle, entry_price, stop_loss, take_profit, fvg_type)
+        # Check for partial profit taking at 3R (before checking SL/TP)
+        # Skip in aggressive mode
+        if not aggressive_mode and not partial_taken:
+            if fvg_type == 'Bullish':
+                current_profit = candle['high'] - entry_price
+            else:  # Bearish
+                current_profit = entry_price - candle['low']
+            
+            current_r = current_profit / sl_distance if sl_distance > 0 else 0
+            
+            if current_r >= 3.0:
+                # Take 50% profit at 3R
+                partial_taken = True
+                partial_r = 3.0 * 0.5  # 50% of 3R = 1.5R
+                current_sl = entry_price  # Move SL to breakeven
+                result['partial_taken'] = True
+                result['partial_r'] = partial_r
+        
+        # Check SL/TP with current SL level
+        outcome = check_sl_tp_hit_on_candle(candle, entry_price, current_sl, take_profit, fvg_type)
         
         if outcome == 'discard':
             result['exit_time'] = candle['time']
@@ -263,28 +298,44 @@ def monitor_trade_on_c3(
             break
         if outcome == 'loss':
             result['exit_time'] = candle['time']
-            result['exit_price'] = stop_loss
-            result['outcome'] = 'loss'
-            price_diff = (stop_loss - entry_price) if fvg_type == 'Bullish' else (entry_price - stop_loss)
+            result['exit_price'] = current_sl
+            
+            if partial_taken:
+                # Hit breakeven after taking partial
+                result['outcome'] = 'breakeven_after_partial'
+                result['r_multiple'] = partial_r  # Only keep the partial profit
+                price_diff = 0.0  # Breakeven on remaining position
+            else:
+                # Full loss
+                result['outcome'] = 'loss'
+                result['r_multiple'] = -1.0
+                price_diff = (current_sl - entry_price) if fvg_type == 'Bullish' else (entry_price - current_sl)
+            
             pips = _price_diff_to_pips(symbol, price_diff)
             result['pips'] = float(pips) if pips is not None else float(price_diff)
-            result['r_multiple'] = -1.0
+            
             # Store potential R if TP had been hit
-            sl_distance = abs(entry_price - stop_loss)
             tp_distance = abs(take_profit - entry_price)
             result['potential_r'] = tp_distance / sl_distance if sl_distance > 0 else 0.0
             break
         elif outcome == 'win':
             result['exit_time'] = candle['time']
             result['exit_price'] = take_profit
-            result['outcome'] = 'win'
+            
+            # Calculate R for remaining 50%
+            tp_distance = abs(take_profit - entry_price)
+            remaining_r = tp_distance / sl_distance if sl_distance > 0 else 0.0
+            
+            if partial_taken:
+                result['outcome'] = 'full_win_with_partial'
+                result['r_multiple'] = partial_r + (remaining_r * 0.5)  # 1R from partial + 50% of full R
+            else:
+                result['outcome'] = 'win'
+                result['r_multiple'] = remaining_r
+            
             price_diff = (take_profit - entry_price) if fvg_type == 'Bullish' else (entry_price - take_profit)
             pips = _price_diff_to_pips(symbol, price_diff)
             result['pips'] = float(pips) if pips is not None else float(price_diff)
-            # Calculate actual R:R based on TP and SL distances
-            sl_distance = abs(entry_price - stop_loss)
-            tp_distance = abs(take_profit - entry_price)
-            result['r_multiple'] = tp_distance / sl_distance if sl_distance > 0 else 0.0
             break
     
     # Calculate hours held if trade closed
@@ -302,12 +353,26 @@ def monitor_trade_extended(
     take_profit: float,
     fvg_type: str,
     after_time: Optional[pd.Timestamp] = None,
-    max_days: Optional[int] = None
+    max_days: Optional[int] = None,
+    aggressive_mode: bool = False
 ) -> Dict:
     """
     Extended monitoring if trade didn't close on C3.
     Fetch additional M5 data and monitor until TP/SL hit or max days reached.
+    
+    Conservative mode (default):
+    - At 3R: Take 50% profit, move SL to breakeven
+    - Let remaining 50% run to TP or new SL
+    
+    Aggressive mode:
+    - No partial profit taking
+    - Hold full position until TP or SL
     """
+    sl_distance = abs(entry_price - stop_loss)
+    partial_taken = False
+    partial_r = 0.0
+    current_sl = stop_loss
+    
     result = {
         'entry_time': entry_time,
         'entry_price': entry_price,
@@ -321,6 +386,8 @@ def monitor_trade_extended(
         'hours_held': 0.0,
         'last_checked_time': None,
         'reason': None,
+        'partial_taken': False,
+        'partial_r': 0.0,
     }
     
     # Fetch M5 data for extended monitoring period
@@ -344,7 +411,26 @@ def monitor_trade_extended(
         if after_time is not None and candle['time'] <= after_time:
             continue
         
-        outcome = check_sl_tp_hit_on_candle(candle, entry_price, stop_loss, take_profit, fvg_type)
+        # Check for partial profit taking at 3R (before checking SL/TP)
+        # Skip in aggressive mode
+        if not aggressive_mode and not partial_taken:
+            if fvg_type == 'Bullish':
+                current_profit = candle['high'] - entry_price
+            else:  # Bearish
+                current_profit = entry_price - candle['low']
+            
+            current_r = current_profit / sl_distance if sl_distance > 0 else 0
+            
+            if current_r >= 3.0:
+                # Take 50% profit at 3R
+                partial_taken = True
+                partial_r = 3.0 * 0.5  # 50% of 3R = 1.5R
+                current_sl = entry_price  # Move SL to breakeven
+                result['partial_taken'] = True
+                result['partial_r'] = partial_r
+        
+        # Check SL/TP with current SL level
+        outcome = check_sl_tp_hit_on_candle(candle, entry_price, current_sl, take_profit, fvg_type)
         
         if outcome == 'discard':
             result['exit_time'] = candle['time']
@@ -356,28 +442,44 @@ def monitor_trade_extended(
             break
         if outcome == 'loss':
             result['exit_time'] = candle['time']
-            result['exit_price'] = stop_loss
-            result['outcome'] = 'loss'
-            price_diff = (stop_loss - entry_price) if fvg_type == 'Bullish' else (entry_price - stop_loss)
+            result['exit_price'] = current_sl
+            
+            if partial_taken:
+                # Hit breakeven after taking partial
+                result['outcome'] = 'breakeven_after_partial'
+                result['r_multiple'] = partial_r  # Only keep the partial profit
+                price_diff = 0.0  # Breakeven on remaining position
+            else:
+                # Full loss
+                result['outcome'] = 'loss'
+                result['r_multiple'] = -1.0
+                price_diff = (current_sl - entry_price) if fvg_type == 'Bullish' else (entry_price - current_sl)
+            
             pips = _price_diff_to_pips(symbol, price_diff)
             result['pips'] = float(pips) if pips is not None else float(price_diff)
-            result['r_multiple'] = -1.0
+            
             # Store potential R if TP had been hit
-            sl_distance = abs(entry_price - stop_loss)
             tp_distance = abs(take_profit - entry_price)
             result['potential_r'] = tp_distance / sl_distance if sl_distance > 0 else 0.0
             break
         elif outcome == 'win':
             result['exit_time'] = candle['time']
             result['exit_price'] = take_profit
-            result['outcome'] = 'win'
+            
+            # Calculate R for remaining 50%
+            tp_distance = abs(take_profit - entry_price)
+            remaining_r = tp_distance / sl_distance if sl_distance > 0 else 0.0
+            
+            if partial_taken:
+                result['outcome'] = 'full_win_with_partial'
+                result['r_multiple'] = partial_r + (remaining_r * 0.5)  # 1R from partial + 50% of full R
+            else:
+                result['outcome'] = 'win'
+                result['r_multiple'] = remaining_r
+            
             price_diff = (take_profit - entry_price) if fvg_type == 'Bullish' else (entry_price - take_profit)
             pips = _price_diff_to_pips(symbol, price_diff)
             result['pips'] = float(pips) if pips is not None else float(price_diff)
-            # Calculate actual R:R based on TP and SL distances
-            sl_distance = abs(entry_price - stop_loss)
-            tp_distance = abs(take_profit - entry_price)
-            result['r_multiple'] = tp_distance / sl_distance if sl_distance > 0 else 0.0
             break
     
     # Calculate hours held if trade closed
@@ -429,7 +531,8 @@ def backtest_validated_fvg(
     fvg: Dict,
     c2_date: pd.Timestamp,
     pattern_type: str,
-    m5_c2: Optional[pd.DataFrame] = None
+    m5_c2: Optional[pd.DataFrame] = None,
+    aggressive_mode: bool = False
 ) -> Optional[Dict]:
     """
     Backtest a single validated FVG.
@@ -439,6 +542,9 @@ def backtest_validated_fvg(
     2. Check if entry triggered on C3
     3. If triggered, monitor trade until completion
     4. Return trade result
+    
+    Args:
+        aggressive_mode: If True, skip partial profit taking at 3R
     """
     if not fvg.get('is_validated') or not fvg.get('validation_levels'):
         return {
@@ -608,7 +714,8 @@ def backtest_validated_fvg(
         entry_price,
         sl_level,
         tp_level,
-        fvg_type
+        fvg_type,
+        aggressive_mode
     )
     
     # If trade didn't close on C3, continue monitoring on subsequent days
@@ -620,7 +727,9 @@ def backtest_validated_fvg(
             sl_level,
             tp_level,
             fvg_type,
-            after_time=trade_result.get('last_checked_time')
+            after_time=m5_c3.iloc[-1]['time'] if len(m5_c3) else entry_time,
+            max_days=30,
+            aggressive_mode=aggressive_mode
         )
     
     # Combine all info
@@ -660,11 +769,20 @@ def calculate_backtest_statistics(results: List[Dict]) -> Dict:
             'entry_rate': 0.0
         }
     
-    # Filter completed trades (win/loss)
-    completed_trades = [r for r in entered_trades if r.get('outcome') in ['win', 'loss']]
+    # Filter completed trades (all outcomes including new partial outcomes)
+    all_outcomes = ['win', 'loss', 'full_win_with_partial', 'breakeven_after_partial']
+    completed_trades = [r for r in entered_trades if r.get('outcome') in all_outcomes]
     
-    wins = [r for r in completed_trades if r['outcome'] == 'win']
-    losses = [r for r in completed_trades if r['outcome'] == 'loss']
+    # Categorize outcomes
+    full_wins = [r for r in completed_trades if r['outcome'] == 'win']
+    full_losses = [r for r in completed_trades if r['outcome'] == 'loss']
+    partial_wins = [r for r in completed_trades if r['outcome'] == 'full_win_with_partial']
+    breakevens = [r for r in completed_trades if r['outcome'] == 'breakeven_after_partial']
+    
+    # For statistics, count wins = full_wins + partial_wins + breakevens (positive outcomes)
+    total_wins = len(full_wins) + len(partial_wins) + len(breakevens)
+    total_losses = len(full_losses)
+    
     discarded = [r for r in entered_trades if r.get('outcome') == 'discarded']
     open_trades = [r for r in entered_trades if r.get('outcome') == 'open']
     pending_trades = [r for r in entered_trades if r.get('outcome') == 'pending']
@@ -672,19 +790,27 @@ def calculate_backtest_statistics(results: List[Dict]) -> Dict:
     total_pips = sum(r.get('pips', 0) for r in completed_trades)
     total_r = sum(r.get('r_multiple', 0) for r in completed_trades)
     
+    # Partial profit statistics
+    trades_with_partial = [r for r in completed_trades if r.get('partial_taken', False)]
+    
     stats = {
         'total_patterns': len(results),
         'entries_triggered': len(entered_trades),
         'entry_rate': len(entered_trades) / len(results) * 100,
         
         'total_trades': len(completed_trades),
-        'wins': len(wins),
-        'losses': len(losses),
+        'wins': total_wins,
+        'losses': total_losses,
+        'full_wins': len(full_wins),
+        'partial_wins': len(partial_wins),
+        'breakevens': len(breakevens),
+        'full_losses': len(full_losses),
+        'trades_with_partial': len(trades_with_partial),
         'discarded': len(discarded),
         'open_trades': len(open_trades),
         'pending_trades': len(pending_trades),
         
-        'win_rate': len(wins) / len(completed_trades) * 100 if completed_trades else 0,
+        'win_rate': total_wins / len(completed_trades) * 100 if completed_trades else 0,
         
         'total_pips': total_pips,
         'average_pips': total_pips / len(completed_trades) if completed_trades else 0,
@@ -703,10 +829,13 @@ def calculate_backtest_statistics(results: List[Dict]) -> Dict:
     return stats
 
 
-def run_backtest_on_patterns(patterns: List[Dict], progress_callback=None) -> Tuple[List[Dict], Dict]:
+def run_backtest_on_patterns(patterns: List[Dict], progress_callback=None, aggressive_mode: bool = False) -> Tuple[List[Dict], Dict]:
     """
     Run backtest on a list of detected patterns.
     Returns (individual_results, statistics)
+    
+    Args:
+        aggressive_mode: If True, skip partial profit taking at 3R
     """
     results = []
     
@@ -766,12 +895,16 @@ def run_backtest_on_patterns(patterns: List[Dict], progress_callback=None) -> Tu
                 chosen_fvg,
                 c2_date,
                 pattern_type,
-                m5_c2=m5_c2
+                m5_c2=m5_c2,
+                aggressive_mode=aggressive_mode
             )
             if result:
                 results.append(result)
         
         stats = calculate_backtest_statistics(results)
+        
+        # Add mode to stats for reference
+        stats['mode'] = 'aggressive' if aggressive_mode else 'conservative'
         
         if progress_callback:
             progress_callback(f"Backtest complete: {len(results)} results")

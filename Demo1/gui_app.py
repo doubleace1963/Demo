@@ -511,27 +511,89 @@ def show_backtest_results(results: List[Dict], stats: Dict):
     """Display backtest results in a new window."""
     result_window = tk.Toplevel()
     result_window.title('Backtest Results')
-    result_window.geometry('900x750')
+    result_window.geometry('1200x850')
+    
+    # Create main scrollable container
+    main_container = ttk.Frame(result_window)
+    main_container.pack(fill='both', expand=True)
+    
+    scroll_canvas = tk.Canvas(main_container, highlightthickness=0)
+    vscroll = ttk.Scrollbar(main_container, orient='vertical', command=scroll_canvas.yview)
+    scroll_canvas.configure(yscrollcommand=vscroll.set)
+    
+    vscroll.pack(side='right', fill='y')
+    scroll_canvas.pack(side='left', fill='both', expand=True)
+    
+    content_frame = ttk.Frame(scroll_canvas)
+    content_window = scroll_canvas.create_window((0, 0), window=content_frame, anchor='nw')
+    
+    def _on_content_configure(_event=None):
+        scroll_canvas.configure(scrollregion=scroll_canvas.bbox('all'))
+    
+    def _on_canvas_configure(event):
+        scroll_canvas.itemconfigure(content_window, width=event.width)
+    
+    content_frame.bind('<Configure>', _on_content_configure)
+    scroll_canvas.bind('<Configure>', _on_canvas_configure)
+    
+    def _on_mousewheel(event):
+        if event.delta:
+            scroll_canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
+    
+    result_window.bind_all('<MouseWheel>', _on_mousewheel)
     
     # Calculate R-multiple distribution for wins and losses
-    winning_trades = [r for r in results if r.get('outcome') == 'win' and r.get('r_multiple') is not None]
+    winning_trades = [r for r in results if r.get('outcome') in ['win', 'full_win_with_partial'] and r.get('r_multiple') is not None]
     losing_trades = [r for r in results if r.get('outcome') == 'loss' and r.get('r_multiple') is not None]
+    breakeven_trades = [r for r in results if r.get('outcome') == 'breakeven_after_partial']
     
-    # Classify winning trades by R achieved
+    # Calculate total R contributed by each range (for wins)
+    wins_0_1_r = sum(t['r_multiple'] for t in winning_trades if 0 <= t['r_multiple'] < 1)
+    wins_1_3_r = sum(t['r_multiple'] for t in winning_trades if 1 <= t['r_multiple'] < 3)
+    wins_3_6_r = sum(t['r_multiple'] for t in winning_trades if 3 <= t['r_multiple'] < 6)
+    wins_6_plus_r = sum(t['r_multiple'] for t in winning_trades if t['r_multiple'] >= 6)
+    total_wins_r = wins_0_1_r + wins_1_3_r + wins_3_6_r + wins_6_plus_r
+    
+    # Count trades per range
     wins_0_1 = sum(1 for t in winning_trades if 0 <= t['r_multiple'] < 1)
     wins_1_3 = sum(1 for t in winning_trades if 1 <= t['r_multiple'] < 3)
     wins_3_6 = sum(1 for t in winning_trades if 3 <= t['r_multiple'] < 6)
     wins_6_plus = sum(1 for t in winning_trades if t['r_multiple'] >= 6)
     
-    # For losing trades, show what their potential R was (i.e., if they had won)
-    # The potential R is stored as 'potential_r' in backtest results
+    # For losing trades, calculate total potential R (what they could have made if won)
+    losses_0_1_r = sum(t.get('potential_r', 0) for t in losing_trades if t.get('potential_r', 0) < 1)
+    losses_1_3_r = sum(t.get('potential_r', 0) for t in losing_trades if 1 <= t.get('potential_r', 0) < 3)
+    losses_3_6_r = sum(t.get('potential_r', 0) for t in losing_trades if 3 <= t.get('potential_r', 0) < 6)
+    losses_6_plus_r = sum(t.get('potential_r', 0) for t in losing_trades if t.get('potential_r', 0) >= 6)
+    total_losses_potential_r = losses_0_1_r + losses_1_3_r + losses_3_6_r + losses_6_plus_r
+    
+    # Count trades per range
     losses_0_1 = sum(1 for t in losing_trades if t.get('potential_r', 0) < 1)
     losses_1_3 = sum(1 for t in losing_trades if 1 <= t.get('potential_r', 0) < 3)
     losses_3_6 = sum(1 for t in losing_trades if 3 <= t.get('potential_r', 0) < 6)
     losses_6_plus = sum(1 for t in losing_trades if t.get('potential_r', 0) >= 6)
     
+    # Calculate profit by symbol (total R-multiple per pair)
+    symbol_profits = {}
+    completed_trades = [r for r in results if r.get('outcome') in ['win', 'loss', 'full_win_with_partial', 'breakeven_after_partial'] and r.get('r_multiple') is not None]
+    for trade in completed_trades:
+        symbol = trade.get('symbol', 'Unknown')
+        r_mult = trade.get('r_multiple', 0)
+        if symbol not in symbol_profits:
+            symbol_profits[symbol] = {'total_r': 0, 'trades': 0, 'wins': 0, 'losses': 0}
+        symbol_profits[symbol]['total_r'] += r_mult
+        symbol_profits[symbol]['trades'] += 1
+        if trade['outcome'] in ['win', 'full_win_with_partial', 'breakeven_after_partial']:
+            symbol_profits[symbol]['wins'] += 1
+        else:
+            symbol_profits[symbol]['losses'] += 1
+    
+    # Sort by total R and get top 3 best and top 5 worst
+    top_symbols = sorted(symbol_profits.items(), key=lambda x: x[1]['total_r'], reverse=True)[:3]
+    worst_symbols = sorted(symbol_profits.items(), key=lambda x: x[1]['total_r'])[:5]
+    
     # Statistics Frame
-    stats_frame = ttk.LabelFrame(result_window, text='Statistics', padding=10)
+    stats_frame = ttk.LabelFrame(content_frame, text='Statistics', padding=10)
     stats_frame.pack(fill='x', padx=10, pady=10)
     
     stats_text = f"""
@@ -539,13 +601,16 @@ Total Patterns Analyzed: {stats.get('total_patterns', 0)}
 Entries Triggered: {stats.get('entries_triggered', 0)} ({stats.get('entry_rate', 0):.1f}%)
 
 Total Trades Completed: {stats.get('total_trades', 0)}
-Wins: {stats.get('wins', 0)}
+Wins: {stats.get('wins', 0)} ({stats.get('win_rate', 0):.1f}% WR)
+  - Full Wins: {stats.get('full_wins', 0)}
+  - Partial Wins: {stats.get('partial_wins', 0)}
+  - Breakevens (after partial): {stats.get('breakevens', 0)}
 Losses: {stats.get('losses', 0)}
+Trades Hit 3R (took partial): {stats.get('trades_with_partial', 0)}
 Discarded: {stats.get('discarded', 0)}
 Open Trades: {stats.get('open_trades', 0)}
 Pending Trades: {stats.get('pending_trades', 0)}
 
-Win Rate: {stats.get('win_rate', 0):.1f}%
 Average R-Multiple: {stats.get('average_r', 0):.2f}R
 Total R: {stats.get('total_r', 0):.2f}R
 
@@ -556,43 +621,77 @@ Average Hours Held: {stats.get('avg_hours_held', 0):.1f}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 WINNING TRADES R-MULTIPLE DISTRIBUTION
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-0-1R:    {wins_0_1:3d} trades ({(wins_0_1/len(winning_trades)*100) if winning_trades else 0:.1f}%)
-1-3R:    {wins_1_3:3d} trades ({(wins_1_3/len(winning_trades)*100) if winning_trades else 0:.1f}%)
-3-6R:    {wins_3_6:3d} trades ({(wins_3_6/len(winning_trades)*100) if winning_trades else 0:.1f}%)
-6+R:     {wins_6_plus:3d} trades ({(wins_6_plus/len(winning_trades)*100) if winning_trades else 0:.1f}%)
+0-1R:    {wins_0_1:3d} trades  +{wins_0_1_r:6.2f}R ({(wins_0_1_r/total_wins_r*100) if total_wins_r > 0 else 0:.1f}% of total R)
+1-3R:    {wins_1_3:3d} trades  +{wins_1_3_r:6.2f}R ({(wins_1_3_r/total_wins_r*100) if total_wins_r > 0 else 0:.1f}% of total R)
+3-6R:    {wins_3_6:3d} trades  +{wins_3_6_r:6.2f}R ({(wins_3_6_r/total_wins_r*100) if total_wins_r > 0 else 0:.1f}% of total R)
+6+R:     {wins_6_plus:3d} trades  +{wins_6_plus_r:6.2f}R ({(wins_6_plus_r/total_wins_r*100) if total_wins_r > 0 else 0:.1f}% of total R)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 LOSING TRADES - POTENTIAL R IF WON
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-0-1R:    {losses_0_1:3d} trades ({(losses_0_1/len(losing_trades)*100) if losing_trades else 0:.1f}%)
-1-3R:    {losses_1_3:3d} trades ({(losses_1_3/len(losing_trades)*100) if losing_trades else 0:.1f}%)
-3-6R:    {losses_3_6:3d} trades ({(losses_3_6/len(losing_trades)*100) if losing_trades else 0:.1f}%)
-6+R:     {losses_6_plus:3d} trades ({(losses_6_plus/len(losing_trades)*100) if losing_trades else 0:.1f}%)
+0-1R:    {losses_0_1:3d} trades  -{losses_0_1_r:6.2f}R ({(losses_0_1_r/total_losses_potential_r*100) if total_losses_potential_r > 0 else 0:.1f}% of potential R)
+1-3R:    {losses_1_3:3d} trades  -{losses_1_3_r:6.2f}R ({(losses_1_3_r/total_losses_potential_r*100) if total_losses_potential_r > 0 else 0:.1f}% of potential R)
+3-6R:    {losses_3_6:3d} trades  -{losses_3_6_r:6.2f}R ({(losses_3_6_r/total_losses_potential_r*100) if total_losses_potential_r > 0 else 0:.1f}% of potential R)
+6+R:     {losses_6_plus:3d} trades  -{losses_6_plus_r:6.2f}R ({(losses_6_plus_r/total_losses_potential_r*100) if total_losses_potential_r > 0 else 0:.1f}% of potential R)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TOP 3 MOST PROFITABLE PAIRS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     """
+    
+    # Add top 3 profitable pairs
+    if top_symbols:
+        for i, (symbol, data) in enumerate(top_symbols, 1):
+            win_rate = (data['wins'] / data['trades'] * 100) if data['trades'] > 0 else 0
+            stats_text += f"#{i}. {symbol:8s} +{data['total_r']:6.2f}R  ({data['wins']}W-{data['losses']}L, {win_rate:.0f}% WR)\n"
+    else:
+        stats_text += "No completed trades to analyze\n"
+    
+    # Add worst 5 performing pairs
+    stats_text += "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    stats_text += "TOP 5 WORST PERFORMING PAIRS\n"
+    stats_text += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    
+    if worst_symbols:
+        for i, (symbol, data) in enumerate(worst_symbols, 1):
+            win_rate = (data['wins'] / data['trades'] * 100) if data['trades'] > 0 else 0
+            stats_text += f"#{i}. {symbol:8s} {data['total_r']:6.2f}R  ({data['wins']}W-{data['losses']}L, {win_rate:.0f}% WR)\n"
+    else:
+        stats_text += "No completed trades to analyze\n"
     
     stats_label = ttk.Label(stats_frame, text=stats_text, justify='left', font=('Courier', 10))
     stats_label.pack()
     
-    # Buttons Frame (at the top)
-    buttons_frame = ttk.Frame(result_window, padding=10)
+    # Buttons Frame
+    buttons_frame = ttk.Frame(content_frame, padding=10)
     buttons_frame.pack(fill='x', padx=10)
     
     # Virtual Account Simulation Button
     def simulate_account():
         """Launch virtual account simulation with equity curve visualization."""
-        # Filter only win and loss trades (note: backtest uses 'win' and 'loss', not 'won'/'lost')
-        completed_trades = [r for r in results if r.get('outcome') in ['win', 'loss']]
+        # Filter completed trades based on mode
+        if stats.get('mode') == 'aggressive':
+            # In aggressive mode, only 'win' and 'loss' outcomes exist
+            completed_trades = [r for r in results if r.get('outcome') in ['win', 'loss']]
+        else:
+            # Conservative mode includes partial outcomes
+            completed_trades = [r for r in results if r.get('outcome') in ['win', 'loss', 'full_win_with_partial', 'breakeven_after_partial']]
         
         if not completed_trades:
-            messagebox.showinfo('No Trades', 'No completed trades (win/loss) to simulate.')
+            messagebox.showinfo('No Trades', 'No completed trades to simulate.')
             return
         
         # Prepare trade data for simulation
         trade_data = []
         for trade in completed_trades:
             if trade.get('entry_time') and trade.get('exit_time'):
-                # Map 'win'/'loss' to 'won'/'lost' for virtual_account module
-                result_status = 'won' if trade['outcome'] == 'win' else 'lost'
+                # Map outcomes to 'won'/'lost' for virtual_account module
+                outcome = trade['outcome']
+                if outcome in ['win', 'full_win_with_partial', 'breakeven_after_partial']:
+                    result_status = 'won'
+                else:
+                    result_status = 'lost'
+                
                 trade_data.append({
                     'entry_time': trade['entry_time'],
                     'exit_time': trade['exit_time'],
@@ -808,56 +907,158 @@ Risk Per Trade: {risk_pct}% of current balance
     export_btn = ttk.Button(buttons_frame, text='Export to CSV', command=export_results)
     export_btn.pack(side='left', padx=5)
     
-    # Results Table
-    table_frame = ttk.LabelFrame(result_window, text='Trade Details', padding=10)
-    table_frame.pack(fill='both', expand=True, padx=10, pady=10)
+    # ==================== ALL EXECUTED TRADES ====================
+    all_trades_frame = ttk.LabelFrame(content_frame, text=f'All Executed Trades ({len(completed_trades)} trades)', padding=10)
+    all_trades_frame.pack(fill='both', expand=True, padx=10, pady=10)
     
-    columns = ('symbol', 'date', 'type', 'entry', 'outcome', 'pips', 'r_mult', 'hours')
-    tree = ttk.Treeview(table_frame, columns=columns, show='headings', height=15)
+    columns = ('symbol', 'date', 'type', 'outcome', 'entry_time', 'exit_time', 'pips', 'r_mult', 'potential_r', 'hours')
+    tree = ttk.Treeview(all_trades_frame, columns=columns, show='headings', height=12)
     
     tree.heading('symbol', text='Symbol')
     tree.heading('date', text='FVG Date')
     tree.heading('type', text='Type')
-    tree.heading('entry', text='Entry')
-    tree.heading('outcome', text='Outcome')
+    tree.heading('outcome', text='Result')
+    tree.heading('entry_time', text='Entry Time')
+    tree.heading('exit_time', text='Exit Time')
     tree.heading('pips', text='Pips')
     tree.heading('r_mult', text='R')
+    tree.heading('potential_r', text='Potential R')
     tree.heading('hours', text='Hours')
     
     tree.column('symbol', width=80)
     tree.column('date', width=100)
-    tree.column('type', width=80)
-    tree.column('entry', width=80)
-    tree.column('outcome', width=80)
-    tree.column('pips', width=80)
+    tree.column('type', width=70)
+    tree.column('outcome', width=60)
+    tree.column('entry_time', width=140)
+    tree.column('exit_time', width=140)
+    tree.column('pips', width=70)
     tree.column('r_mult', width=60)
+    tree.column('potential_r', width=90)
     tree.column('hours', width=60)
     
-    vsb = ttk.Scrollbar(table_frame, orient='vertical', command=tree.yview)
-    tree.configure(yscroll=vsb.set)
+    vsb1 = ttk.Scrollbar(all_trades_frame, orient='vertical', command=tree.yview)
+    tree.configure(yscroll=vsb1.set)
     tree.pack(side='left', fill='both', expand=True)
-    vsb.pack(side='right', fill='y')
+    vsb1.pack(side='right', fill='y')
     
-    # Populate results
-    for result in results:
-        if result.get('entry_triggered', False):
-            date_str = result['fvg_date'].strftime('%Y-%m-%d')
-            entry_str = 'Yes' if result.get('entry_time') else 'No'
-            outcome = result.get('outcome', 'N/A')
-            pips = result.get('pips', 0)
-            r_mult = result.get('r_multiple', 0)
-            hours = result.get('hours_held', 0)
+    # Sorting state
+    sort_state = {'column': 'date', 'reverse': False}
+    
+    def sort_tree_by_column(col):
+        """Sort tree contents when a column header is clicked."""
+        # Toggle sort direction if clicking the same column
+        if sort_state['column'] == col:
+            sort_state['reverse'] = not sort_state['reverse']
+        else:
+            sort_state['column'] = col
+            sort_state['reverse'] = False
+        
+        # Get all items and their values
+        items = [(tree.set(item, col), item) for item in tree.get_children('')]
+        
+        # Sort based on column type
+        def sort_key(x):
+            val = x[0]
+            # Handle numeric columns
+            if col in ('pips', 'r_mult', 'potential_r', 'hours'):
+                try:
+                    # Handle '-' for potential_r on wins
+                    return float(val) if val != '-' else -999999
+                except ValueError:
+                    return -999999
+            # Handle date/time columns
+            elif col in ('date', 'entry_time', 'exit_time'):
+                if val == 'N/A':
+                    return datetime.min if not sort_state['reverse'] else datetime.max
+                try:
+                    if col == 'date':
+                        return datetime.strptime(val, '%Y-%m-%d')
+                    else:
+                        return datetime.strptime(val, '%Y-%m-%d %H:%M')
+                except ValueError:
+                    return datetime.min if not sort_state['reverse'] else datetime.max
+            # String columns (symbol, type, outcome)
+            else:
+                return val.lower()
+        
+        items.sort(key=sort_key, reverse=sort_state['reverse'])
+        
+        # Rearrange items in sorted order
+        for index, (val, item) in enumerate(items):
+            tree.move(item, '', index)
+        
+        # Update column heading to show sort direction
+        for column in columns:
+            heading_text = {
+                'symbol': 'Symbol',
+                'date': 'FVG Date',
+                'type': 'Type',
+                'outcome': 'Result',
+                'entry_time': 'Entry Time',
+                'exit_time': 'Exit Time',
+                'pips': 'Pips',
+                'r_mult': 'R',
+                'potential_r': 'Potential R',
+                'hours': 'Hours'
+            }[column]
             
-            tree.insert('', 'end', values=(
-                result['symbol'],
-                date_str,
-                result['fvg_type'],
-                entry_str,
-                outcome,
-                f"{pips:.1f}",
-                f"{r_mult:.1f}",
-                f"{hours:.1f}"
-            ))
+            if column == col:
+                arrow = ' ▼' if sort_state['reverse'] else ' ▲'
+                tree.heading(column, text=heading_text + arrow)
+            else:
+                tree.heading(column, text=heading_text)
+    
+    # Bind column headings to sorting function
+    for col in columns:
+        tree.heading(col, command=lambda c=col: sort_tree_by_column(c))
+    
+    # Populate executed trades
+    for result in completed_trades:
+        date_str = result.get('fvg_date', datetime.now()).strftime('%Y-%m-%d')
+        entry_time_str = result.get('entry_time', '').strftime('%Y-%m-%d %H:%M') if result.get('entry_time') else 'N/A'
+        exit_time_str = result.get('exit_time', '').strftime('%Y-%m-%d %H:%M') if result.get('exit_time') else 'N/A'
+        outcome = result.get('outcome', 'N/A')
+        pips = result.get('pips', 0)
+        r_mult = result.get('r_multiple', 0)
+        potential_r = result.get('potential_r', 0)
+        hours = result.get('hours_held', 0)
+        
+        # Color code based on outcome
+        if outcome in ['win', 'full_win_with_partial']:
+            tag = 'win'
+        elif outcome == 'breakeven_after_partial':
+            tag = 'breakeven'
+        else:
+            tag = 'loss'
+        
+        # Display outcome in readable format
+        outcome_display = {
+            'win': 'WIN',
+            'full_win_with_partial': 'WIN (Partial)',
+            'breakeven_after_partial': 'BE (Partial)',
+            'loss': 'LOSS'
+        }.get(outcome, outcome.upper())
+        
+        tree.insert('', 'end', values=(
+            result.get('symbol', 'N/A'),
+            date_str,
+            result.get('fvg_type', 'N/A'),
+            outcome_display,
+            entry_time_str,
+            exit_time_str,
+            f"{pips:.1f}",
+            f"{r_mult:.2f}",
+            f"{potential_r:.2f}" if outcome == 'loss' else '-',
+            f"{hours:.1f}"
+        ), tags=(tag,))
+    
+    # Color tags
+    tree.tag_configure('win', foreground='green')
+    tree.tag_configure('breakeven', foreground='orange')
+    tree.tag_configure('loss', foreground='red')
+    
+    # Apply initial sort by date
+    sort_tree_by_column('date')
 
 
 def create_gui() -> tk.Tk:
@@ -904,6 +1105,28 @@ def create_gui() -> tk.Tk:
     stop_btn.grid(row=0, column=1, padx=2)
     backtest_btn.grid(row=0, column=2, padx=2)
     save_btn.grid(row=0, column=3, padx=2)
+
+    # Trading mode selection (Conservative vs Aggressive)
+    mode_frame = ttk.LabelFrame(frm, text='Trading Mode', padding=5)
+    mode_frame.grid(row=3, column=0, columnspan=2, pady=(10, 0), sticky='w')
+    
+    trading_mode_var = tk.StringVar(value='conservative')
+    
+    conservative_radio = ttk.Radiobutton(
+        mode_frame, 
+        text='Conservative (Partial @ 3R)', 
+        variable=trading_mode_var, 
+        value='conservative'
+    )
+    conservative_radio.grid(row=0, column=0, padx=5, sticky='w')
+    
+    aggressive_radio = ttk.Radiobutton(
+        mode_frame, 
+        text='Aggressive (Full TP only)', 
+        variable=trading_mode_var, 
+        value='aggressive'
+    )
+    aggressive_radio.grid(row=0, column=1, padx=5, sticky='w')
 
     list_frame = ttk.Frame(root, padding=(10, 6))
     list_frame.pack(fill='both', expand=True)
@@ -1017,6 +1240,9 @@ def create_gui() -> tk.Tk:
         backtest_btn.config(state='disabled')
         status_var.set('Preparing backtest...')
         
+        # Get selected trading mode
+        use_aggressive_mode = (trading_mode_var.get() == 'aggressive')
+        
         def backtest_worker():
             # Add validated FVGs to patterns
             patterns_with_fvgs = []
@@ -1031,7 +1257,8 @@ def create_gui() -> tk.Tk:
             
             results, stats = backtest_engine.run_backtest_on_patterns(
                 patterns_with_fvgs,
-                progress_callback=on_progress
+                progress_callback=on_progress,
+                aggressive_mode=use_aggressive_mode
             )
             
             root.after(0, lambda: show_backtest_results(results, stats))

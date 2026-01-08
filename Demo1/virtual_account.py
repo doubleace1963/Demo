@@ -41,6 +41,9 @@ def simulate_virtual_account(trades, initial_balance=5000, risk_per_trade_pct=1.
     equity_curve = [(sorted_trades[0]['entry_time'], initial_balance)]
     trade_results = []
     
+    # Debug: Print the risk percentage being used
+    print(f"[VIRTUAL ACCOUNT] Using {risk_per_trade_pct}% risk per trade on ${initial_balance} initial balance")
+    
     # Process each trade
     for trade in sorted_trades:
         entry_time = trade['entry_time']
@@ -48,7 +51,7 @@ def simulate_virtual_account(trades, initial_balance=5000, risk_per_trade_pct=1.
         r_multiple = trade['r_multiple']
         result = trade['result']
         
-        # Calculate risk amount at entry (1% of current balance)
+        # Calculate risk amount at entry (risk_per_trade_pct% of current balance)
         risk_amount = current_balance * (risk_per_trade_pct / 100)
         
         # Calculate P&L based on R multiple

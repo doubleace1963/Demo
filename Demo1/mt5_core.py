@@ -45,7 +45,10 @@ def get_available_symbols() -> List[str]:
     ]
     
     # Metals and crypto
-    special_instruments = ['XAGUSD', 'XAUUSD', 'BTCUSD', 'ETHUSD']
+    special_instruments = ['XAGUSD', 'BTCUSD', 'ETHUSD']
+    
+    # Excluded symbols (e.g., poor performance)
+    excluded_symbols = {'XAUUSD'}
     
     # Combined whitelist (case-insensitive base matching)
     whitelist = set(s.upper() for s in forex_base + special_instruments)
@@ -63,6 +66,10 @@ def get_available_symbols() -> List[str]:
         # Modern broker pattern: check if base symbol (without suffix) is in our whitelist
         # Remove common suffixes: 'z', 'm', '.a', etc.
         base_name = name.rstrip('zm').rstrip('.a').rstrip('.m').upper()
+        
+        # Exclude specific symbols
+        if base_name in excluded_symbols:
+            continue
         
         if base_name in whitelist:
             filtered.append(name)
